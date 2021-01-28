@@ -45,14 +45,15 @@ const (
 
 // allocatorHelper encapsulates state for allocating CPUs.
 type allocatorHelper struct {
-	logger.Logger               // allocatorHelper logger instance
-	sys           sysfs.System  // sysfs CPU and topology information
-	topology      topologyCache // cached topology information
-	flags         AllocFlag     // allocation preferences
-	from          cpuset.CPUSet // set of CPUs to allocate from
-	prefer        CPUPriority   // CPU priority to prefer
-	cnt           int           // number of CPUs to allocate
-	result        cpuset.CPUSet // set of CPUs allocated
+	logger.Logger                    // allocatorHelper logger instance
+	sys             sysfs.System     // sysfs CPU and topology information
+	topology        topologyCache    // cached topology information
+	flags           AllocFlag        // allocation preferences
+	from            cpuset.CPUSet    // set of CPUs to allocate from
+	prefer          CPUPriority      // CPU priority to prefer
+	packagePriority map[idset.ID]int // CPU package priority order (lower is higher priority)
+	cnt             int              // number of CPUs to allocate
+	result          cpuset.CPUSet    // set of CPUs allocated
 
 	pkgs []sysfs.CPUPackage // physical CPU packages, sorted by preference
 	cpus []sysfs.CPU        // CPU cores, sorted by preference
@@ -195,13 +196,24 @@ func (a *allocatorHelper) takeIdleCores() {
 			return cset.Intersection(a.from).Equals(cset) && cset.ToSlice()[0] == int(id)
 		})
 
-	// sorted by id
 	sort.Slice(cores,
 		func(i, j int) bool {
+			iCore, jCore := cores[i], cores[j]
+			iPkg := a.sys.CPU(iCore).PackageID()
+			jPkg := a.sys.CPU(jCore).PackageID()
+
+			// First, sort by package priority (try hard to allocate from a single package)
+			if a.packagePriority[iPkg] != a.packagePriority[jPkg] {
+				return a.packagePriority[iPkg] < a.packagePriority[jPkg]
+			}
+
+			// Next, sort by cpu priority preference
 			if res := a.topology.cpuPriorities.cmpCPUSet(a.topology.core[cores[i]], a.topology.core[cores[j]], a.prefer, -1); res != 0 {
 				return res > 0
 			}
-			return cores[i] < cores[j]
+
+			// Finally sort by core id
+			return iCore < jCore
 		})
 
 	a.Debug(" => idle cores sorted by preference: %v", cores)
@@ -264,11 +276,8 @@ func (a *allocatorHelper) takeIdleThreads() {
 			}
 
 			// Always sort cores in package order
-			if res := a.topology.cpuPriorities.cmpCPUSet(iPkgSet.Intersection(a.from), jPkgSet.Intersection(a.from), a.prefer, a.cnt); res != 0 {
-				return res > 0
-			}
 			if iPkg != jPkg {
-				return iPkg < jPkg
+				return a.packagePriority[iPkg] < a.packagePriority[jPkg]
 			}
 
 			iCset := cpuset.NewCPUSet(int(cores[i]))
@@ -326,6 +335,8 @@ func (a *allocatorHelper) takeAny() {
 // Perform CPU allocation.
 func (a *allocatorHelper) allocate() cpuset.CPUSet {
 	if a.sys != nil {
+		a.packagePriority = a.getPackagePriorities()
+
 		if (a.flags & AllocIdlePackages) != 0 {
 			a.takeIdlePackages()
 		}
@@ -345,6 +356,97 @@ func (a *allocatorHelper) allocate() cpuset.CPUSet {
 	return cpuset.NewCPUSet()
 }
 
+// getPackagePriorities calculates priority order between cpu packages for one
+// allocation request represented by allocatorHelper
+func (a *allocatorHelper) getPackagePriorities() map[idset.ID]int {
+	pkgs := a.sys.PackageIDs()
+	offline := a.sys.Offlined()
+
+	pkgAvail := make(map[idset.ID]int, len(pkgs))
+	pkgPrioAvail := make(map[idset.ID][NumCPUPriorities]int, len(pkgs))
+	for _, pkg := range pkgs {
+		avail := a.topology.pkg[pkg].Difference(offline).Intersection(a.from)
+		prioAvail := [NumCPUPriorities]int{}
+		for prio := PriorityHigh; prio < NumCPUPriorities; prio++ {
+			prioAvail[prio] = avail.Intersection(a.topology.cpuPriorities[prio]).Size()
+		}
+		pkgAvail[pkg] = avail.Size()
+		pkgPrioAvail[pkg] = prioAvail
+	}
+
+	// Sort packages in terms of available cpu capacity and cpu priority
+	sort.Slice(pkgs, func(i, j int) bool {
+		iPkg := pkgs[i]
+		jPkg := pkgs[j]
+
+		iTotal, jTotal := 0, 0
+		priorityPreference := 0
+		availabilityPreference := 0
+
+		// Favor pkgs having enough available cpus with the requested or lower priority
+		for prio := a.prefer; prio < NumCPUPriorities; prio++ {
+			iTotal += pkgPrioAvail[iPkg][prio]
+			jTotal += pkgPrioAvail[jPkg][prio]
+
+			// Prefer package that has more available cpus with the preferred priority
+			// NOTE: This is simple and some weight function might be better,
+			// e.g. currently 1*High+3*Low is preferred over 4*Normal (if 4*High was requested)
+			if pkgPrioAvail[iPkg][prio] != pkgPrioAvail[jPkg][prio] && priorityPreference == 0 {
+				priorityPreference = pkgPrioAvail[iPkg][prio] - pkgPrioAvail[jPkg][prio]
+			}
+		}
+
+		// Prefer packages that have more available cpus in total
+		availabilityPreference = iTotal - jTotal
+
+		if iTotal >= a.cnt && jTotal >= a.cnt {
+			// Enough available cpus guaranteed, return better match in terms
+			// of cpu priority
+			if priorityPreference != 0 {
+				return priorityPreference > 0
+			}
+			return iPkg < jPkg
+		} else if iTotal >= a.cnt || jTotal >= a.cnt {
+			return availabilityPreference > 0
+		}
+
+		// See if "stealing" from higher priority cores would fulfill the request
+		for prio := a.prefer - 1; prio >= PriorityHigh; prio-- {
+			iTotal += pkgPrioAvail[iPkg][prio]
+			jTotal += pkgPrioAvail[jPkg][prio]
+
+			if iTotal >= a.cnt && jTotal >= a.cnt {
+				// Deliberatly favor package that better matches in terms of
+				// cpus with requested or lower than requested priority
+				if availabilityPreference != 0 {
+					return availabilityPreference > 0
+				}
+				if priorityPreference != 0 {
+					return priorityPreference > 0
+				}
+				return iPkg < jPkg
+			} else if iTotal >= a.cnt || jTotal >= a.cnt {
+				return iTotal > jTotal
+			}
+		}
+
+		// If neither package can fit the request prefer one that has more
+		// available cpus in total
+		if pkgAvail[iPkg] != pkgAvail[jPkg] {
+			return pkgAvail[iPkg] > pkgAvail[jPkg]
+		}
+
+		return iPkg < jPkg
+	})
+
+	ret := make(map[idset.ID]int, len(pkgs))
+	for i, id := range pkgs {
+		ret[id] = i
+	}
+	log.Debug("calculated package priorities: %v", ret)
+	return ret
+}
+
 func (ca *cpuAllocator) allocateCpus(from *cpuset.CPUSet, cnt int, prefer CPUPriority) (cpuset.CPUSet, error) {
 	var result cpuset.CPUSet
 	var err error
@@ -359,7 +461,6 @@ func (ca *cpuAllocator) allocateCpus(from *cpuset.CPUSet, cnt int, prefer CPUPri
 		a.from = from.Clone()
 		a.cnt = cnt
 		a.prefer = prefer
-
 		result, err, *from = a.allocate(), nil, a.from.Clone()
 
 		a.Debug("%d cpus from #%v (preferring #%v) => #%v", cnt, from.Union(result), a.prefer, result)
@@ -632,9 +733,10 @@ func (p CPUPriority) String() string {
 }
 
 // cmpCPUSet compares two cpusets in terms of preferred cpu priority. Returns:
-//   > 0 if cpuset A is preferred
-//   < 0 if cpuset B is preferred
-//   0 if cpusets A and B are equal in terms of cpu priority
+//
+//	> 0 if cpuset A is preferred
+//	< 0 if cpuset B is preferred
+//	0 if cpusets A and B are equal in terms of cpu priority
 func (c *cpuPriorities) cmpCPUSet(csetA, csetB cpuset.CPUSet, prefer CPUPriority, cpuCnt int) int {
 	if prefer == PriorityNone {
 		return 0
