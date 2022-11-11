@@ -206,7 +206,10 @@ func (p *balloons) Sync(add []cache.Container, del []cache.Container) error {
 
 // AllocateResources is a resource allocation request for this policy.
 func (p *balloons) AllocateResources(c cache.Container) error {
-	log.Debug("allocating resources for container %s...", c.PrettyName())
+	log.Debug("allocating resources for container %s (request %d mCPU, limit %d mCPU)...",
+		c.PrettyName(),
+		p.containerRequestedMilliCpus(c.GetCacheID()),
+		p.containerLimitedMilliCpus(c.GetCacheID()))
 	bln, err := p.allocateBalloon(c)
 	if err != nil {
 		return balloonsError("balloon allocation for container %s failed: %w", c.PrettyName(), err)
@@ -396,6 +399,18 @@ func (p *balloons) containerRequestedMilliCpus(contID string) int {
 		return 0
 	}
 	reqCpu, ok := cont.GetResourceRequirements().Requests[corev1.ResourceCPU]
+	if !ok {
+		return 0
+	}
+	return int(reqCpu.MilliValue())
+}
+
+func (p *balloons) containerLimitedMilliCpus(contID string) int {
+	cont, ok := p.cch.LookupContainer(contID)
+	if !ok {
+		return 0
+	}
+	reqCpu, ok := cont.GetResourceRequirements().Limits[corev1.ResourceCPU]
 	if !ok {
 		return 0
 	}
