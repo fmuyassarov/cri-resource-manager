@@ -60,6 +60,7 @@ type balloons struct {
 	allowed   cpuset.CPUSet             // bounding set of CPUs we're allowed to use
 	reserved  cpuset.CPUSet             // system-/kube-reserved CPUs
 	freeCpus  cpuset.CPUSet             // CPUs to be included in growing or new ballons
+	cpuTree   *cpuTreeNode              // system CPU topology
 
 	reservedBalloonDef *BalloonDef // built-in definition of the reserved balloon
 	defaultBalloonDef  *BalloonDef // built-in definition of the default balloon
@@ -131,12 +132,17 @@ func (bln Balloon) MaxAvailMilliCpus(freeCpus cpuset.CPUSet) int {
 
 // CreateBalloonsPolicy creates a new policy instance.
 func CreateBalloonsPolicy(policyOptions *policy.BackendOptions) policy.Backend {
+	var err error
 	p := &balloons{
 		options:      policyOptions,
 		cch:          policyOptions.Cache,
 		cpuAllocator: cpuallocator.NewCPUAllocator(policyOptions.System),
 	}
 	log.Info("creating %s policy...", PolicyName)
+	if p.cpuTree, err = NewCpuTreeFromSystem(); err != nil {
+		log.Errorf("creating CPU topology tree failed: %s", err)
+	}
+	log.Debug("CPU topology: %s", p.cpuTree)
 	// Handle common policy options: AvailableResources and ReservedResources.
 	// p.allowed: CPUs available for the policy
 	if allowed, ok := policyOptions.Available[policyapi.DomainCPU]; ok {
@@ -1070,35 +1076,44 @@ func (p *balloons) resizeBalloon(bln *Balloon, newMilliCpus int) error {
 	if bln.Def.MinCpus > 0 && newCpuCount < bln.Def.MinCpus {
 		newCpuCount = bln.Def.MinCpus
 	}
-	log.Debugf("resize %s to capacity %d: CPUs from %d to %d. freecpus: %#s", bln, newMilliCpus, oldCpuCount, newCpuCount, p.freeCpus)
+	log.Debugf("resize %s to fit %d mCPU", bln, newMilliCpus)
+	log.Debugf("- change full CPUs from %d to %d", oldCpuCount, newCpuCount)
+	log.Debugf("- freecpus: %#s", p.freeCpus)
 	if oldCpuCount == newCpuCount {
 		return nil
 	}
+	cpuCountDelta := newCpuCount - oldCpuCount
 	p.forgetCpuClass(bln)
 	defer p.useCpuClass(bln)
-	if newCpuCount > oldCpuCount {
-		oldCpus := bln.Cpus.Clone()
-		keptCpus, err := p.cpuAllocator.ReleaseCpus(&oldCpus, oldCpuCount, bln.Def.AllocatorPriority)
-		if err != nil || keptCpus.Size() != 0 {
-			return balloonsError("resize/inflate: releasing %d CPUs from %s failed: %w (kept: %s)", oldCpuCount, bln, err, keptCpus)
-		}
-		p.freeCpus = p.freeCpus.Union(bln.Cpus)
-		newCpus, err := p.cpuAllocator.AllocateCpus(&p.freeCpus, newCpuCount, bln.Def.AllocatorPriority)
+	if cpuCountDelta > 0 {
+		// Inflate the balloon.
+		addFromCpus, _, err := p.cpuTree.ResizeCpus(bln.Cpus, p.freeCpus, cpuCountDelta)
 		if err != nil {
-			return balloonsError("resize/inflate: allocating %d CPUs for %s failed: %w", newCpuCount, bln, err)
+			return balloonsError("resize/inflate: failed to choose a cpuset for allocating additional %d CPUs: %w", cpuCountDelta, err)
 		}
-		bln.Cpus = newCpus
+		log.Debugf("- allocate CPUs %d from %#s", cpuCountDelta, addFromCpus)
+		newCpus, err := p.cpuAllocator.AllocateCpus(&addFromCpus, newCpuCount-oldCpuCount, bln.Def.AllocatorPriority)
+		if err != nil {
+			return balloonsError("resize/inflate: allocating %d CPUs for %s failed: %w", cpuCountDelta, bln, err)
+		}
+		p.freeCpus = p.freeCpus.Difference(newCpus)
+		bln.Cpus = bln.Cpus.Union(newCpus)
 	} else {
-		keptCpus, err := p.cpuAllocator.ReleaseCpus(&bln.Cpus, oldCpuCount-newCpuCount, bln.Def.AllocatorPriority)
-		if err != nil || keptCpus.Size() != newCpuCount {
-			return balloonsError("resize/deflate: releasing %d CPUs from %s failed: %w (kept: %s)", oldCpuCount-newCpuCount, bln, err, keptCpus)
+		// Deflate the balloon.
+		_, removeFromCpus, err := p.cpuTree.ResizeCpus(bln.Cpus, p.freeCpus, cpuCountDelta)
+		if err != nil {
+			return balloonsError("resize/deflate: failed to choose a cpuset for releasing %d CPUs: %w", -cpuCountDelta, err)
 		}
-		log.Debugf("freeCpus: %s, bln.Cpus: %s, keptCpus: %s", p.freeCpus, bln.Cpus, keptCpus)
-		p.freeCpus = p.freeCpus.Union(bln.Cpus)
-		bln.Cpus = keptCpus
-		log.Debugf("new freeCpus: %s, new bln.Cpus: %s", p.freeCpus, bln.Cpus)
+		log.Debugf("- releasing %d CPUs from cpuset %#s", -cpuCountDelta, removeFromCpus)
+		_, err = p.cpuAllocator.ReleaseCpus(&removeFromCpus, -cpuCountDelta, bln.Def.AllocatorPriority)
+		if err != nil {
+			return balloonsError("resize/deflate: releasing %d CPUs from %s failed: %w", -cpuCountDelta, bln, err)
+		}
+		log.Debugf("- old freeCpus: %#s, old bln.Cpus: %#s, releasing: %#s", p.freeCpus, bln.Cpus, removeFromCpus)
+		p.freeCpus = p.freeCpus.Union(removeFromCpus)
+		bln.Cpus = bln.Cpus.Difference(removeFromCpus)
 	}
-	log.Debugf("resize successful: %s, freecpus: %#s", bln, p.freeCpus)
+	log.Debugf("- resize successful: %s, freecpus: %#s", bln, p.freeCpus)
 	bln.Mems = p.closestMems(bln.Cpus)
 	for _, cID := range bln.ContainerIDs() {
 		if c, ok := p.cch.LookupContainer(cID); ok {
