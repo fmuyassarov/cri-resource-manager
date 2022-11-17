@@ -22,6 +22,15 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 )
 
+type cpuTreeAllocator struct {
+	options cpuTreeAllocatorOptions
+	root    *cpuTreeNode
+}
+
+type cpuTreeAllocatorOptions struct {
+	topologyBalancing bool
+}
+
 type cpuTreeNode struct {
 	name     string
 	parent   *cpuTreeNode
@@ -92,34 +101,44 @@ func (t *cpuTreeNode) String() string {
 	return fmt.Sprintf("%s%v", t.name, t.children)
 }
 
-func sorterAllocate(tnas []cpuTreeNodeAttributes) func(int, int) bool {
+func (t *cpuTreeNode) NewAllocator(options cpuTreeAllocatorOptions) *cpuTreeAllocator {
+	ta := &cpuTreeAllocator{
+		root:    t,
+		options: options,
+	}
+	return ta
+}
+
+func (ta *cpuTreeAllocator) sorterAllocate(tnas []cpuTreeNodeAttributes) func(int, int) bool {
 	return func(i, j int) bool {
 		if tnas[i].depth != tnas[j].depth {
 			return tnas[i].depth > tnas[j].depth
 		}
 		for tdepth := 0; tdepth < len(tnas[i].currentCpuCounts); tdepth += 1 {
-			// After this currentCpus will increase. Aim
-			// to maximize the maximal amount of
-			// currentCpus as high level in the topology
-			// as possible.
+			// After this currentCpus will increase.
+			// Maximize the maximal amount of currentCpus
+			// as high level in the topology as possible.
 			if tnas[i].currentCpuCounts[tdepth] != tnas[j].currentCpuCounts[tdepth] {
 				return tnas[i].currentCpuCounts[tdepth] > tnas[j].currentCpuCounts[tdepth]
 			}
 		}
 		for tdepth := 0; tdepth < len(tnas[i].freeCpuCounts); tdepth += 1 {
-			// After this freeCpus will decrease. Aim to
-			// minimize the maximum freeCpus for spreading
-			// CPU usage across the topology for
-			// performance.
+			// After this freeCpus will decrease.
 			if tnas[i].freeCpuCounts[tdepth] != tnas[j].freeCpuCounts[tdepth] {
-				return tnas[i].freeCpuCounts[tdepth] > tnas[j].freeCpuCounts[tdepth]
+				if ta.options.topologyBalancing {
+					// Goal: minimize maximal freeCpus in topology.
+					return tnas[i].freeCpuCounts[tdepth] > tnas[j].freeCpuCounts[tdepth]
+				} else {
+					// Goal: maximize maximal freeCpus in topology.
+					return tnas[i].freeCpuCounts[tdepth] < tnas[j].freeCpuCounts[tdepth]
+				}
 			}
 		}
 		return i > j
 	}
 }
 
-func sorterRelease(tnas []cpuTreeNodeAttributes) func(int, int) bool {
+func (ta *cpuTreeAllocator) sorterRelease(tnas []cpuTreeNodeAttributes) func(int, int) bool {
 	return func(i, j int) bool {
 		if tnas[i].depth != tnas[j].depth {
 			return tnas[i].depth > tnas[j].depth
@@ -140,7 +159,11 @@ func sorterRelease(tnas []cpuTreeNodeAttributes) func(int, int) bool {
 			// isolation as high level in the topology as
 			// possible.
 			if tnas[i].freeCpuCounts[tdepth] != tnas[j].freeCpuCounts[tdepth] {
-				return tnas[i].freeCpuCounts[tdepth] < tnas[j].freeCpuCounts[tdepth]
+				if ta.options.topologyBalancing {
+					return tnas[i].freeCpuCounts[tdepth] < tnas[j].freeCpuCounts[tdepth]
+				} else {
+					return tnas[i].freeCpuCounts[tdepth] < tnas[j].freeCpuCounts[tdepth]
+				}
 			}
 		}
 		return i < j
@@ -152,9 +175,9 @@ func sorterRelease(tnas []cpuTreeNodeAttributes) func(int, int) bool {
 //     can be allocated.
 //   - removeFromCpus contains CPUs in currentCpus set from which delta CPUs
 //     can be freed.
-func (t *cpuTreeNode) ResizeCpus(currentCpus, freeCpus cpuset.CPUSet, delta int) (cpuset.CPUSet, cpuset.CPUSet, error) {
+func (ta *cpuTreeAllocator) ResizeCpus(currentCpus, freeCpus cpuset.CPUSet, delta int) (cpuset.CPUSet, cpuset.CPUSet, error) {
 	if delta > 0 {
-		return t.resizeCpus(currentCpus, freeCpus, delta)
+		return ta.resizeCpus(currentCpus, freeCpus, delta)
 	}
 	// In multi-CPU removal, remove CPUs one by one instead of
 	// trying to find a single topology element from which all of
@@ -162,7 +185,7 @@ func (t *cpuTreeNode) ResizeCpus(currentCpus, freeCpus cpuset.CPUSet, delta int)
 	removeFrom := cpuset.NewCPUSet()
 	addFrom := cpuset.NewCPUSet()
 	for n := 0; n < -delta; n++ {
-		_, removeSingleFrom, err := t.resizeCpus(currentCpus, freeCpus, -1)
+		_, removeSingleFrom, err := ta.resizeCpus(currentCpus, freeCpus, -1)
 		if err != nil {
 			return addFrom, removeFrom, err
 		}
@@ -185,8 +208,8 @@ func (t *cpuTreeNode) ResizeCpus(currentCpus, freeCpus cpuset.CPUSet, delta int)
 	return addFrom, removeFrom, nil
 }
 
-func (t *cpuTreeNode) resizeCpus(currentCpus, freeCpus cpuset.CPUSet, delta int) (cpuset.CPUSet, cpuset.CPUSet, error) {
-	tnas := t.ToAttributedSlice(currentCpus, freeCpus,
+func (ta *cpuTreeAllocator) resizeCpus(currentCpus, freeCpus cpuset.CPUSet, delta int) (cpuset.CPUSet, cpuset.CPUSet, error) {
+	tnas := ta.root.ToAttributedSlice(currentCpus, freeCpus,
 		func(tna *cpuTreeNodeAttributes) bool {
 			// filter out branches with insufficient cpus
 			if delta > 0 && tna.freeCpuCount-delta < 0 {
@@ -204,9 +227,9 @@ func (t *cpuTreeNode) resizeCpus(currentCpus, freeCpus cpuset.CPUSet, delta int)
 	// TODO: Parameterize the sort function based on
 	// - Spread or pack tightly balloons to resource zones
 	if delta > 0 {
-		sort.Slice(tnas, sorterAllocate(tnas))
+		sort.Slice(tnas, ta.sorterAllocate(tnas))
 	} else {
-		sort.Slice(tnas, sorterRelease(tnas))
+		sort.Slice(tnas, ta.sorterRelease(tnas))
 	}
 	for i, tna := range tnas {
 		log.Debugf("%d: %s", i, tna)

@@ -30,6 +30,22 @@ type cpuInTopology struct {
 
 type cpusInTopology map[int]cpuInTopology
 
+func (cit cpuInTopology) TopoName(topoLevel string) string {
+	switch topoLevel {
+	case "thread":
+		return cit.threadName
+	case "core":
+		return cit.coreName
+	case "numa":
+		return cit.numaName
+	case "die":
+		return cit.dieName
+	case "package":
+		return cit.packageName
+	}
+	panic("invalid topoLevel")
+}
+
 func (csit cpusInTopology) dumps(nameCpus map[string]cpuset.CPUSet) string {
 	lines := []string{}
 	names := make([]string, 0, len(nameCpus))
@@ -98,23 +114,12 @@ func verifyNotOn(t *testing.T, nameContents string, cpus cpuset.CPUSet, csit cpu
 }
 
 func verifySame(t *testing.T, topoLevel string, cpus cpuset.CPUSet, csit cpusInTopology) {
-	t.Logf("Verify that cpus %s are on the same %s.", cpus, topoLevel)
 	seenName := ""
 	seenCpuID := -1
 	for _, cpuID := range cpus.ToSlice() {
 		cit := csit[cpuID]
-		thisName := ""
+		thisName := cit.TopoName(topoLevel)
 		thisCpuID := cit.cpuID
-		switch topoLevel {
-		case "core":
-			thisName = cit.coreName
-		case "numa":
-			thisName = cit.numaName
-		case "die":
-			thisName = cit.dieName
-		case "package":
-			thisName = cit.packageName
-		}
 		if thisName == "" {
 			t.Errorf("unexpected (invalid) topology level %q", topoLevel)
 		}
@@ -123,10 +128,32 @@ func verifySame(t *testing.T, topoLevel string, cpus cpuset.CPUSet, csit cpusInT
 			seenCpuID = cit.cpuID
 		}
 		if seenName != thisName {
-			t.Errorf("cpu on unexpected (not same) %s: cpu%d is in %s, cpu%d is in %s",
+			t.Errorf("expected the same %s, got: cpu%d in %s, cpu%d in %s",
 				topoLevel,
 				seenCpuID, seenName,
 				thisCpuID, thisName)
+		}
+	}
+}
+
+func (csit cpusInTopology) getElements(topoLevel string, cpus cpuset.CPUSet) []string {
+	elts := []string{}
+	for _, cpuID := range cpus.ToSlice() {
+		elts = append(elts, csit[cpuID].TopoName(topoLevel))
+	}
+	return elts
+}
+
+func (csit cpusInTopology) verifyDisjoint(t *testing.T, topoLevel string, cpusA cpuset.CPUSet, cpusB cpuset.CPUSet) {
+	eltsA := csit.getElements(topoLevel, cpusA)
+	eltsB := csit.getElements(topoLevel, cpusB)
+	for _, eltA := range eltsA {
+		for _, eltB := range eltsB {
+			if eltA == eltB {
+				t.Errorf("expected disjoint %ss, got %s on both cpusets %s and %s",
+					topoLevel, eltA, cpusA, cpusB)
+				return
+			}
 		}
 	}
 }
@@ -170,29 +197,65 @@ allocations: []int{
 */
 
 func TestResizeCpus(t *testing.T) {
+	type TopoCcids struct {
+		topo  string
+		ccids []int
+	}
 	tcases := []struct {
 		name                string
 		topology            [5]int // package, die, numa, core, thread count
+		allocatorTB         bool   // allocator topologyBalancing
 		allocations         []int
 		deltas              []int
 		allocate            bool
 		operateOnCcid       []int // which ccid (currentCpus id) will be used on call
 		expectCurrentOnSame []string
+		expectAllOnSame     []string
 		expectCurrentNotOn  []string
-		expectedAddSizes    []int
-		expectedErrors      []string
+		expectAddSizes      []int
+		expectDisjoint      []TopoCcids // which ccids should be disjoint
+		expectErrors        []string
 	}{
 		{
-			name:             "first allocations",
-			topology:         [5]int{2, 2, 2, 2, 2},
-			deltas:           []int{0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32},
-			expectedAddSizes: []int{0, 1, 2, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32},
+			name:           "first allocations",
+			topology:       [5]int{2, 2, 2, 2, 2},
+			deltas:         []int{0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32},
+			expectAddSizes: []int{0, 1, 2, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32},
 		},
 		{
-			name:           "too large an allocation",
-			topology:       [5]int{2, 2, 2, 2, 2},
-			deltas:         []int{33},
-			expectedErrors: []string{"not enough free CPUs"},
+			name:         "too large an allocation",
+			topology:     [5]int{2, 2, 2, 2, 2},
+			deltas:       []int{33},
+			expectErrors: []string{"not enough free CPUs"},
+		},
+		{
+			name:          "spread allocations",
+			topology:      [5]int{2, 2, 2, 2, 2},
+			allocatorTB:   true,
+			deltas:        []int{1, 1, 1, 1, 1, 1, 1, 1},
+			allocate:      true,
+			operateOnCcid: []int{1, 2, 3, 4, 5, 6, 7, 8},
+			expectDisjoint: []TopoCcids{
+				{},
+				{"package", []int{1, 2}},
+				{"die", []int{1, 2, 3}},
+				{"die", []int{1, 2, 3, 4}},
+				{"numa", []int{1, 2, 3, 4, 5}},
+				{"numa", []int{1, 2, 3, 4, 5, 6}},
+				{"numa", []int{1, 2, 3, 4, 5, 6, 7}},
+				{"numa", []int{1, 2, 3, 4, 5, 6, 7, 8}},
+			},
+		},
+		{
+			name:          "pack allocations",
+			topology:      [5]int{2, 2, 2, 2, 2},
+			allocatorTB:   false,
+			deltas:        []int{1, 1, 1, 1},
+			allocate:      true,
+			operateOnCcid: []int{1, 2, 3, 4, 5},
+			expectAllOnSame: []string{
+				"", "core", "numa", "numa", "die", "die",
+			},
 		},
 		{
 			name:     "inflate",
@@ -211,7 +274,7 @@ func TestResizeCpus(t *testing.T) {
 				"core", "core", "numa", "numa",
 				"die", "die",
 				"package", "package", "package"},
-			expectedAddSizes: []int{
+			expectAddSizes: []int{
 				1, 1, 1, 1,
 				1, 3,
 				8, 1, 1},
@@ -328,6 +391,9 @@ func TestResizeCpus(t *testing.T) {
 	for _, tc := range tcases {
 		t.Run(tc.name, func(t *testing.T) {
 			tree, csit := newCpuTreeFromInt5(tc.topology)
+			treeA := tree.NewAllocator(cpuTreeAllocatorOptions{
+				topologyBalancing: tc.allocatorTB,
+			})
 			currentCpus := cpuset.NewCPUSet()
 			freeCpus := tree.Cpus()
 			if len(tc.allocations) > 0 {
@@ -341,22 +407,22 @@ func TestResizeCpus(t *testing.T) {
 					currentCpus = ccidCurrentCpus[tc.operateOnCcid[i]]
 				}
 				t.Logf("ResizeCpus(current=%s; free=%s; delta=%d)", currentCpus, freeCpus, delta)
-				addFrom, removeFrom, err := tree.ResizeCpus(currentCpus, freeCpus, delta)
+				addFrom, removeFrom, err := treeA.ResizeCpus(currentCpus, freeCpus, delta)
 				t.Logf("== addFrom=%s; removeFrom=%s, err=%v", addFrom, removeFrom, err)
-				if i < len(tc.expectedAddSizes) {
-					if tc.expectedAddSizes[i] != addFrom.Size() {
-						t.Errorf("expected add size: %d, got %d", tc.expectedAddSizes[i], addFrom.Size())
+				if i < len(tc.expectAddSizes) {
+					if tc.expectAddSizes[i] != addFrom.Size() {
+						t.Errorf("expected add size: %d, got %d", tc.expectAddSizes[i], addFrom.Size())
 					}
 				}
-				if i < len(tc.expectedErrors) {
-					if tc.expectedErrors[i] == "" && err != nil {
+				if i < len(tc.expectErrors) {
+					if tc.expectErrors[i] == "" && err != nil {
 						t.Errorf("expected nil error, but got %v", err)
 					}
-					if tc.expectedErrors[i] != "" {
+					if tc.expectErrors[i] != "" {
 						if err == nil {
-							t.Errorf("expected error containing %q, got nil", tc.expectedErrors[i])
-						} else if !strings.Contains(fmt.Sprintf("%s", err), tc.expectedErrors[i]) {
-							t.Errorf("expected error containing %q, got %q", tc.expectedErrors[i], err)
+							t.Errorf("expected error containing %q, got nil", tc.expectErrors[i])
+						} else if !strings.Contains(fmt.Sprintf("%s", err), tc.expectErrors[i]) {
+							t.Errorf("expected error containing %q, got %q", tc.expectErrors[i], err)
 						}
 					}
 				}
@@ -389,13 +455,33 @@ func TestResizeCpus(t *testing.T) {
 
 					allocs["free"] = freeCpus
 					t.Logf("=> current=%s; free=%s", currentCpus, freeCpus)
-					t.Logf("current and free cpus:\n%s\n", csit.dumps(allocs))
 					if i < len(tc.expectCurrentOnSame) && tc.expectCurrentOnSame[i] != "" {
 						verifySame(t, tc.expectCurrentOnSame[i], currentCpus, csit)
 					}
 					if i < len(tc.expectCurrentNotOn) && tc.expectCurrentNotOn[i] != "" {
 						verifyNotOn(t, tc.expectCurrentNotOn[i], currentCpus, csit)
 					}
+					if i < len(tc.expectAllOnSame) && tc.expectAllOnSame[i] != "" {
+						allCpus := cpuset.NewCPUSet()
+						for _, cpus := range ccidCurrentCpus {
+							allCpus = allCpus.Union(cpus)
+						}
+						verifySame(t, tc.expectAllOnSame[i], allCpus, csit)
+					}
+
+					if i < len(tc.expectDisjoint) && len(tc.expectDisjoint) > 1 {
+						for first := 0; first < len(tc.expectDisjoint[i].ccids); first++ {
+							for second := first + 1; second < len(tc.expectDisjoint[i].ccids); second++ {
+								csit.verifyDisjoint(t, tc.expectDisjoint[i].topo,
+									ccidCurrentCpus[tc.expectDisjoint[i].ccids[first]],
+									ccidCurrentCpus[tc.expectDisjoint[i].ccids[second]])
+							}
+						}
+					}
+				}
+				if t.Failed() {
+					t.Logf("current and free cpus:\n%s\n", csit.dumps(allocs))
+					break
 				}
 			}
 		})

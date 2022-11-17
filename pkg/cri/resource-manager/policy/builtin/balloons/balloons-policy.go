@@ -54,13 +54,14 @@ const (
 
 // balloons contains configuration and runtime attributes of the balloons policy
 type balloons struct {
-	options   *policyapi.BackendOptions // configuration common to all policies
-	bpoptions BalloonsOptions           // balloons-specific configuration
-	cch       cache.Cache               // cri-resmgr cache
-	allowed   cpuset.CPUSet             // bounding set of CPUs we're allowed to use
-	reserved  cpuset.CPUSet             // system-/kube-reserved CPUs
-	freeCpus  cpuset.CPUSet             // CPUs to be included in growing or new ballons
-	cpuTree   *cpuTreeNode              // system CPU topology
+	options          *policyapi.BackendOptions // configuration common to all policies
+	bpoptions        BalloonsOptions           // balloons-specific configuration
+	cch              cache.Cache               // cri-resmgr cache
+	allowed          cpuset.CPUSet             // bounding set of CPUs we're allowed to use
+	reserved         cpuset.CPUSet             // system-/kube-reserved CPUs
+	freeCpus         cpuset.CPUSet             // CPUs to be included in growing or new ballons
+	cpuTree          *cpuTreeNode              // system CPU topology
+	cpuTreeAllocator *cpuTreeAllocator         // CPU allocator from system CPU topology
 
 	reservedBalloonDef *BalloonDef // built-in definition of the reserved balloon
 	defaultBalloonDef  *BalloonDef // built-in definition of the default balloon
@@ -544,7 +545,7 @@ func (p *balloons) newBalloon(blnDef *BalloonDef, confCpus bool) (*Balloon, erro
 		// So does the default balloon unless its CPU counts are tweaked.
 		cpus = p.reserved
 	} else {
-		fromCpus, _, err := p.cpuTree.ResizeCpus(cpuset.NewCPUSet(), p.freeCpus, blnDef.MinCpus)
+		fromCpus, _, err := p.cpuTreeAllocator.ResizeCpus(cpuset.NewCPUSet(), p.freeCpus, blnDef.MinCpus)
 		if err != nil {
 			return nil, balloonsError("failed to choose a cpuset for allocating first %d CPUs from %#s", blnDef.MinCpus, p.freeCpus)
 		}
@@ -988,6 +989,9 @@ func (p *balloons) setConfig(bpoptions *BalloonsOptions) error {
 	p.balloons = []*Balloon{}
 	p.freeCpus = p.allowed.Clone()
 	p.freeCpus = p.freeCpus.Difference(p.reserved)
+	p.cpuTreeAllocator = p.cpuTree.NewAllocator(cpuTreeAllocatorOptions{
+		topologyBalancing: bpoptions.AllocatorTopologyBalancing,
+	})
 	// Instantiate built-in reserved and default balloons.
 	reservedBalloon, err := p.newBalloon(p.reservedBalloonDef, false)
 	if err != nil {
@@ -1092,7 +1096,7 @@ func (p *balloons) resizeBalloon(bln *Balloon, newMilliCpus int) error {
 	defer p.useCpuClass(bln)
 	if cpuCountDelta > 0 {
 		// Inflate the balloon.
-		addFromCpus, _, err := p.cpuTree.ResizeCpus(bln.Cpus, p.freeCpus, cpuCountDelta)
+		addFromCpus, _, err := p.cpuTreeAllocator.ResizeCpus(bln.Cpus, p.freeCpus, cpuCountDelta)
 		if err != nil {
 			return balloonsError("resize/inflate: failed to choose a cpuset for allocating additional %d CPUs: %w", cpuCountDelta, err)
 		}
@@ -1105,7 +1109,7 @@ func (p *balloons) resizeBalloon(bln *Balloon, newMilliCpus int) error {
 		bln.Cpus = bln.Cpus.Union(newCpus)
 	} else {
 		// Deflate the balloon.
-		_, removeFromCpus, err := p.cpuTree.ResizeCpus(bln.Cpus, p.freeCpus, cpuCountDelta)
+		_, removeFromCpus, err := p.cpuTreeAllocator.ResizeCpus(bln.Cpus, p.freeCpus, cpuCountDelta)
 		if err != nil {
 			return balloonsError("resize/deflate: failed to choose a cpuset for releasing %d CPUs: %w", -cpuCountDelta, err)
 		}
