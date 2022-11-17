@@ -16,6 +16,7 @@ package balloons
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
@@ -28,6 +29,25 @@ type cpuInTopology struct {
 }
 
 type cpusInTopology map[int]cpuInTopology
+
+func (csit cpusInTopology) dumps(nameCpus map[string]cpuset.CPUSet) string {
+	lines := []string{}
+	names := make([]string, 0, len(nameCpus))
+	for name := range nameCpus {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for cpuID := 0; cpuID < len(csit); cpuID++ {
+		line := fmt.Sprintf("cpu%02d %s", cpuID, csit[cpuID].threadName)
+		for _, name := range names {
+			if nameCpus[name].Contains(cpuID) {
+				line = fmt.Sprintf("%s %s", line, name)
+			}
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
 
 func newCpuTreeFromInt5(pdnct [5]int) (*cpuTreeNode, cpusInTopology) {
 	pkgs := pdnct[0]
@@ -48,10 +68,10 @@ func newCpuTreeFromInt5(pdnct [5]int) (*cpuTreeNode, cpusInTopology) {
 				numaTree := NewCpuTree(fmt.Sprintf("p%dd%dn%d", packageID, dieID, numaID))
 				dieTree.AddChild(numaTree)
 				for coreID := 0; coreID < cores; coreID++ {
-					coreTree := NewCpuTree(fmt.Sprintf("p%dd%dn%dc%d", packageID, dieID, numaID, coreID))
+					coreTree := NewCpuTree(fmt.Sprintf("p%dd%dn%dc%02d", packageID, dieID, numaID, coreID))
 					numaTree.AddChild(coreTree)
 					for threadID := 0; threadID < threads; threadID++ {
-						threadTree := NewCpuTree(fmt.Sprintf("p%dd%dn%dc%dt%d", packageID, dieID, numaID, coreID, threadID))
+						threadTree := NewCpuTree(fmt.Sprintf("p%dd%dn%dc%02dt%d", packageID, dieID, numaID, coreID, threadID))
 						coreTree.AddChild(threadTree)
 						threadTree.AddCpus(cpuset.NewCPUSet(cpuID))
 						csit[cpuID] = cpuInTopology{
@@ -156,7 +176,7 @@ func TestResizeCpus(t *testing.T) {
 		allocations         []int
 		deltas              []int
 		allocate            bool
-		addToCurrent        []int
+		operateOnCcid       []int // which ccid (currentCpus id) will be used on call
 		expectCurrentOnSame []string
 		expectCurrentNotOn  []string
 		expectedAddSizes    []int
@@ -183,7 +203,7 @@ func TestResizeCpus(t *testing.T) {
 				1, 3, // cpu4..cpu7 on numaN1, still dieD0
 				6, 1, 1, // cpu8..15 on dieD1, still packageP0
 			},
-			addToCurrent: []int{
+			operateOnCcid: []int{
 				1, 1, 1, 1,
 				1, 1,
 				1, 1, 1},
@@ -218,6 +238,7 @@ func TestResizeCpus(t *testing.T) {
 				-1, // release cpu2 or cpu3
 				-1, // release cpu2 or cpu3
 			},
+			operateOnCcid: []int{1, 1, 1, 1, 1, 1, 1},
 			expectCurrentOnSame: []string{
 				"",
 				"package",
@@ -232,7 +253,7 @@ func TestResizeCpus(t *testing.T) {
 				"p1",
 				"p0d1",
 				"p0d0n1",
-				"p0d0n0c0",
+				"p0d0n0c00",
 			},
 		},
 		{
@@ -263,11 +284,38 @@ func TestResizeCpus(t *testing.T) {
 				-5, // release completely p0, one from p1d1nX
 				-3, // release completely p1d1nX => all on same numa
 			},
+			operateOnCcid: []int{1, 1, 1, 1},
 			expectCurrentOnSame: []string{
 				"",
 				"",
 				"die",
 				"numa",
+			},
+			expectCurrentNotOn: []string{
+				"",
+				"p0d1",
+				"p0",
+				"",
+			},
+		},
+		{
+			name:     "gentle rebalancing",
+			topology: [5]int{2, 1, 1, 16, 2}, // 2 packages, 16 hyperthreaded cores per package => 64 cpus in total
+			deltas: []int{
+				4, 4, 14, 7, 7, 4, 4, 14, // allocate 8 sets of cpus, the last 14cpus fills package0, spills over to package1
+				-2, -2, -2, -2, // free a little room to package0
+				-1, 1, -1, 1, -1, 1, -1, 1}, // deflate/inflate the last 14cpus, see that it gradually travels to package0
+			operateOnCcid: []int{
+				1, 2, 3, 4, 5, 6, 7, 8,
+				1, 2, 3, 4,
+				8, 8, 8, 8, 8, 8, 8, 8,
+			},
+			allocate: true,
+			expectCurrentOnSame: []string{
+				"package", "package", "package", "package",
+				"package", "package", "package", "",
+				"", "", "", "",
+				"", "", "", "", "", "", "package", "package",
 			},
 			expectCurrentNotOn: []string{
 				"",
@@ -282,11 +330,16 @@ func TestResizeCpus(t *testing.T) {
 			tree, csit := newCpuTreeFromInt5(tc.topology)
 			currentCpus := cpuset.NewCPUSet()
 			freeCpus := tree.Cpus()
-			for _, cpuID := range tc.allocations {
-				currentCpus = currentCpus.Union(cpuset.NewCPUSet(cpuID))
-				freeCpus = freeCpus.Difference(cpuset.NewCPUSet(cpuID))
+			if len(tc.allocations) > 0 {
+				currentCpus = currentCpus.Union(cpuset.NewCPUSet(tc.allocations...))
+				freeCpus = freeCpus.Difference(cpuset.NewCPUSet(tc.allocations...))
 			}
+			ccidCurrentCpus := map[int]cpuset.CPUSet{0: currentCpus}
+			allocs := map[string]cpuset.CPUSet{"--:allo": currentCpus}
 			for i, delta := range tc.deltas {
+				if i < len(tc.operateOnCcid) && tc.operateOnCcid[i] > 0 {
+					currentCpus = ccidCurrentCpus[tc.operateOnCcid[i]]
+				}
 				t.Logf("ResizeCpus(current=%s; free=%s; delta=%d)", currentCpus, freeCpus, delta)
 				addFrom, removeFrom, err := tree.ResizeCpus(currentCpus, freeCpus, delta)
 				t.Logf("== addFrom=%s; removeFrom=%s, err=%v", addFrom, removeFrom, err)
@@ -308,22 +361,35 @@ func TestResizeCpus(t *testing.T) {
 					}
 				}
 				if tc.allocate {
+					allocName := fmt.Sprintf("%02d:allo", i+1)
+					allocs[allocName] = cpuset.NewCPUSet()
+
 					for n, cpuID := range addFrom.ToSlice() {
 						if n >= delta {
 							break
 						}
 						freeCpus = freeCpus.Difference(cpuset.NewCPUSet(cpuID))
 						currentCpus = currentCpus.Union(cpuset.NewCPUSet(cpuID))
-
+						allocs[allocName] = allocs[allocName].Union(cpuset.NewCPUSet(cpuID))
 					}
+					allocName = fmt.Sprintf("%02d:free", i+1)
 					for n, cpuID := range removeFrom.ToSlice() {
 						if n >= -delta {
 							break
 						}
 						freeCpus = freeCpus.Union(cpuset.NewCPUSet(cpuID))
-						currentCpus = currentCpus.Difference(cpuset.NewCPUSet(cpuID))
+						if i < len(tc.operateOnCcid) && tc.operateOnCcid[i] > 0 {
+							currentCpus = currentCpus.Difference(cpuset.NewCPUSet(cpuID))
+						}
+						allocs[allocName] = allocs[allocName].Union(cpuset.NewCPUSet(cpuID))
 					}
+					if i < len(tc.operateOnCcid) && tc.operateOnCcid[i] > 0 {
+						ccidCurrentCpus[tc.operateOnCcid[i]] = currentCpus
+					}
+
+					allocs["free"] = freeCpus
 					t.Logf("=> current=%s; free=%s", currentCpus, freeCpus)
+					t.Logf("current and free cpus:\n%s\n", csit.dumps(allocs))
 					if i < len(tc.expectCurrentOnSame) && tc.expectCurrentOnSame[i] != "" {
 						verifySame(t, tc.expectCurrentOnSame[i], currentCpus, csit)
 					}

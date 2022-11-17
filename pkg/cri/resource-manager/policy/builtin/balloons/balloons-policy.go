@@ -544,10 +544,15 @@ func (p *balloons) newBalloon(blnDef *BalloonDef, confCpus bool) (*Balloon, erro
 		// So does the default balloon unless its CPU counts are tweaked.
 		cpus = p.reserved
 	} else {
-		cpus, err = p.cpuAllocator.AllocateCpus(&p.freeCpus, blnDef.MinCpus, blnDef.AllocatorPriority)
+		fromCpus, _, err := p.cpuTree.ResizeCpus(cpuset.NewCPUSet(), p.freeCpus, blnDef.MinCpus)
+		if err != nil {
+			return nil, balloonsError("failed to choose a cpuset for allocating first %d CPUs from %#s", blnDef.MinCpus, p.freeCpus)
+		}
+		cpus, err = p.cpuAllocator.AllocateCpus(&fromCpus, blnDef.MinCpus, blnDef.AllocatorPriority)
 		if err != nil {
 			return nil, balloonsError("could not allocate %d MinCpus for balloon %s[%d]: %w", blnDef.MinCpus, blnDef.Name, freeInstance, err)
 		}
+		p.freeCpus = p.freeCpus.Difference(cpus)
 	}
 	bln := &Balloon{
 		Def:      blnDef,
