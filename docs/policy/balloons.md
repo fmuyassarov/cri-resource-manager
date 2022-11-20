@@ -73,6 +73,13 @@ Balloons policy parameters:
 - `ReservedPoolNamespaces` is a list of namespaces (wildcards allowed)
   that are assigned to the special reserved balloon, that is, will run
   on reserved CPUs. This always includes the `kube-system` namespace.
+- `AllocatorTopologyBalancing` affects selecting CPUs for new
+  balloons. If `true`, new balloons are created using CPUs on
+  package/die/NUMA with most free CPUs. This optimizes for performance
+  and inflating balloons within the same package/die/NUMA. The default
+  is `false`: pack new balloons tightly on the same
+  packages/dies/NUMAs. This optimizes for powersaving by enabing deep
+  sleep states on large parts of the hardware.
 - `BalloonTypes` is a list of balloon type definitions. Each type can
   be configured with the following parameters:
   - `Name` of the balloon type. This is used in pod annotations to
