@@ -82,6 +82,9 @@ type Balloon struct {
 	// Mems is the set of memory nodes with minimal access delay
 	// from CPUs.
 	Mems idset.IDSet
+	// SharedFreeCpus is the set of idle CPUs that balloon is allowed to use
+	// with other balloons that shareIdleCpus
+	SharedFreeCpus cpuset.CPUSet
 	// PodIDs maps pod ID to list of container IDs.
 	// - len(PodIDs) is the number of pods in the balloon.
 	// - len(PodIDs[podID]) is the number of containers of podID
@@ -176,7 +179,7 @@ func CreateBalloonsPolicy(policyOptions *policy.BackendOptions) policy.Backend {
 	if err := p.setConfig(balloonsOptions); err != nil {
 		log.Fatal("failed to create %s policy: %v", PolicyName, err)
 	}
-
+	log.Debug("first effective configuration:\n%s\n", utils.DumpJSON(p.bpoptions))
 	pkgcfg.GetModule(PolicyPath).AddNotify(p.configNotify)
 
 	return p
@@ -556,11 +559,12 @@ func (p *balloons) newBalloon(blnDef *BalloonDef, confCpus bool) (*Balloon, erro
 		p.freeCpus = p.freeCpus.Difference(cpus)
 	}
 	bln := &Balloon{
-		Def:      blnDef,
-		Instance: freeInstance,
-		PodIDs:   make(map[string][]string),
-		Cpus:     cpus,
-		Mems:     p.closestMems(cpus),
+		Def:            blnDef,
+		Instance:       freeInstance,
+		PodIDs:         make(map[string][]string),
+		Cpus:           cpus,
+		SharedFreeCpus: cpuset.NewCPUSet(),
+		Mems:           p.closestMems(cpus),
 	}
 	if confCpus {
 		if err = p.useCpuClass(bln); err != nil {
@@ -621,7 +625,18 @@ func (p *balloons) chooseBalloonInstance(blnDef *BalloonDef, fm FillMethod, c ca
 			}
 		}
 		if newBln, err := p.newBalloon(blnDef, true); err == nil {
+			if newBln.MaxAvailMilliCpus(p.freeCpus) < reqMilliCpus {
+				if fm == FillNewBalloonMust {
+					return nil, balloonsError("not enough CPUs to run container %s requesting %s mCPU. %s.MaxCPUs: %d mCPU, free CPUs: %s",
+						c.PrettyName(), reqMilliCpus, blnDef.Name, blnDef.MaxCpus*1000, p.freeCpus.Size()*1000)
+				} else {
+					return nil, nil
+				}
+			}
 			p.balloons = append(p.balloons, newBln)
+			if newBln.Cpus.Size() > 0 {
+				p.updatePinning(p.shareFreeCpus(p.freeCpus, newBln.Cpus)...)
+			}
 			return newBln, nil
 		} else {
 			if fm == FillNewBalloonMust {
@@ -1030,6 +1045,7 @@ func (p *balloons) setConfig(bpoptions *BalloonsOptions) error {
 	}
 	// No errors in balloon creation, take new configuration into use.
 	p.bpoptions = *bpoptions
+	p.updatePinning(p.shareFreeCpus(p.freeCpus, cpuset.NewCPUSet())...)
 	// (Re)configures all CPUs in balloons.
 	p.resetCpuClass()
 	for _, bln := range p.balloons {
@@ -1107,6 +1123,10 @@ func (p *balloons) resizeBalloon(bln *Balloon, newMilliCpus int) error {
 		}
 		p.freeCpus = p.freeCpus.Difference(newCpus)
 		bln.Cpus = bln.Cpus.Union(newCpus)
+		// CPUs that were removed from freeCpus and added to
+		// the balloon cannot be anymore shared among balloons
+		// that have shown interest in ShareIdleCpusInSame...
+		p.updatePinning(p.shareFreeCpus(p.freeCpus, newCpus)...)
 	} else {
 		// Deflate the balloon.
 		_, removeFromCpus, err := p.cpuTreeAllocator.ResizeCpus(bln.Cpus, p.freeCpus, cpuCountDelta)
@@ -1121,15 +1141,81 @@ func (p *balloons) resizeBalloon(bln *Balloon, newMilliCpus int) error {
 		log.Debugf("- old freeCpus: %#s, old bln.Cpus: %#s, releasing: %#s", p.freeCpus, bln.Cpus, removeFromCpus)
 		p.freeCpus = p.freeCpus.Union(removeFromCpus)
 		bln.Cpus = bln.Cpus.Difference(removeFromCpus)
+		// CPUs that were removed from the balloon and added
+		// to freeCpus can be now shared among balloons that
+		// have shown interest in ShareIdleCpusInSame...
+		p.updatePinning(p.shareFreeCpus(removeFromCpus, cpuset.NewCPUSet())...)
 	}
 	log.Debugf("- resize successful: %s, freecpus: %#s", bln, p.freeCpus)
-	bln.Mems = p.closestMems(bln.Cpus)
-	for _, cID := range bln.ContainerIDs() {
-		if c, ok := p.cch.LookupContainer(cID); ok {
-			p.pinCpuMem(c, bln.Cpus, bln.Mems)
+	p.updatePinning(bln)
+	return nil
+}
+
+func (p *balloons) updatePinning(blns ...*Balloon) {
+	for _, bln := range blns {
+		cpus := bln.Cpus.Union(bln.SharedFreeCpus)
+		bln.Mems = p.closestMems(cpus)
+		for _, cID := range bln.ContainerIDs() {
+			if c, ok := p.cch.LookupContainer(cID); ok {
+				p.pinCpuMem(c, cpus, bln.Mems)
+			}
 		}
 	}
-	return nil
+}
+
+// shareFreeCpus adds addCpus and removes removeCpus to those balloons
+// that whose containers are allowed to use shared free CPUs. Returns
+// balloons that will need re-pinning.
+func (p *balloons) shareFreeCpus(addCpus, removeCpus cpuset.CPUSet) []*Balloon {
+	updateBalloons := map[int]struct{}{}
+	if removeCpus.Size() > 0 {
+		for blnIdx, bln := range p.balloons {
+			if bln.SharedFreeCpus.Intersection(removeCpus).Size() > 0 {
+				bln.SharedFreeCpus = bln.SharedFreeCpus.Difference(removeCpus)
+				updateBalloons[blnIdx] = struct{}{}
+			}
+		}
+	}
+	if addCpus.Size() > 0 {
+		for blnIdx, bln := range p.balloons {
+			topoLevel := bln.Def.ShareIdleCpusInSame
+			if topoLevel == CPUTopologyLevelUndefined {
+				continue
+			}
+			log.Debugf("looking for freecpus in topolevel %s with cpus %s", topoLevel, bln.Cpus)
+			freeCpusInTopoLevel := cpuset.NewCPUSet()
+			p.cpuTree.DepthFirstWalk(func(t *cpuTreeNode) error {
+				// Dive in correct topology level.
+				if t.level != topoLevel {
+					log.Debugf("wrong topo level: %s!=%s, walk more...", t.level, topoLevel)
+					return nil
+				}
+				// Does the balloon include CPUs of this level?
+				if t.cpus.Intersection(bln.Cpus).Size() == 0 {
+					log.Debugf("non-overlapping cpus: %s and %s: skip children of %s", t.cpus, bln.Cpus, t.name)
+					return WalkSkipChildren
+				}
+				freeCpusInTopoLevel = freeCpusInTopoLevel.Union(t.cpus.Intersection(addCpus))
+				log.Debugf("added intersection of %s and %s, now %s", t.cpus, addCpus, freeCpusInTopoLevel)
+				return WalkSkipChildren
+			})
+			if freeCpusInTopoLevel.Size() == 0 {
+				continue
+			}
+			sharedBefore := bln.SharedFreeCpus.Size()
+			bln.SharedFreeCpus = bln.SharedFreeCpus.Union(freeCpusInTopoLevel)
+			sharedNow := bln.SharedFreeCpus.Size()
+			if sharedBefore != sharedNow {
+				updateBalloons[blnIdx] = struct{}{}
+			}
+		}
+	}
+	updatedBalloons := make([]*Balloon, 0, len(updateBalloons))
+	for blnIdx, _ := range updateBalloons {
+		updatedBalloons = append(updatedBalloons, p.balloons[blnIdx])
+		log.Debugf("DELME: balloon %d uses free CPUs: %s", p.balloons[blnIdx], p.balloons[blnIdx].SharedFreeCpus)
+	}
+	return updatedBalloons
 }
 
 // assignContainer adds a container to a balloon
@@ -1139,7 +1225,7 @@ func (p *balloons) assignContainer(c cache.Container, bln *Balloon) {
 	// if necessary
 	podID := c.GetPodID()
 	bln.PodIDs[podID] = append(bln.PodIDs[podID], c.GetCacheID())
-	p.pinCpuMem(c, bln.Cpus, bln.Mems)
+	p.updatePinning(bln)
 }
 
 // dismissContainer removes a container from a balloon

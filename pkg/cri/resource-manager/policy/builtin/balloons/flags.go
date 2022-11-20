@@ -97,6 +97,8 @@ type BalloonDef struct {
 	// prefer using filling free capacity and possibly inflating
 	// existing balloons before creating new ones.
 	PreferNewBalloons bool
+
+	ShareIdleCpusInSame CPUTopologyLevel `json:"ShareIdleCPUsInSame,omitempty"`
 }
 
 var defaultPinCPU bool = true

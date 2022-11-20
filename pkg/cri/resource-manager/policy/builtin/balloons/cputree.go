@@ -15,11 +15,26 @@
 package balloons
 
 import (
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 
 	system "github.com/intel/cri-resource-manager/pkg/sysfs"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
+)
+
+type CPUTopologyLevel int
+
+const (
+	CPUTopologyLevelUndefined CPUTopologyLevel = iota
+	CPUTopologyLevelSystem
+	CPUTopologyLevelPackage
+	CPUTopologyLevelDie
+	CPUTopologyLevelNuma
+	CPUTopologyLevelCore
+	CPUTopologyLevelThread
 )
 
 type cpuTreeAllocator struct {
@@ -33,6 +48,7 @@ type cpuTreeAllocatorOptions struct {
 
 type cpuTreeNode struct {
 	name     string
+	level    CPUTopologyLevel
 	parent   *cpuTreeNode
 	children []*cpuTreeNode
 	cpus     cpuset.CPUSet
@@ -44,23 +60,30 @@ func NewCpuTreeFromSystem() (*cpuTreeNode, error) {
 		return nil, err
 	}
 	sysTree := NewCpuTree("system")
+	sysTree.level = CPUTopologyLevelSystem
 	for _, packageID := range sys.PackageIDs() {
 		packageTree := NewCpuTree(fmt.Sprintf("p%d", packageID))
+		packageTree.level = CPUTopologyLevelPackage
 		cpuPackage := sys.Package(packageID)
 		sysTree.AddChild(packageTree)
 		for _, dieID := range cpuPackage.DieIDs() {
 			dieTree := NewCpuTree(fmt.Sprintf("p%dd%d", packageID, dieID))
+			dieTree.level = CPUTopologyLevelDie
 			packageTree.AddChild(dieTree)
 			for _, nodeID := range cpuPackage.DieNodeIDs(dieID) {
 				nodeTree := NewCpuTree(fmt.Sprintf("p%dd%dn%d", packageID, dieID, nodeID))
+				nodeTree.level = CPUTopologyLevelNuma
 				dieTree.AddChild(nodeTree)
 				node := sys.Node(nodeID)
 				for _, cpuID := range node.CPUSet().ToSlice() {
 					cpuTree := NewCpuTree(fmt.Sprintf("p%dd%dn%dcpu%d", packageID, dieID, nodeID, cpuID))
+
+					cpuTree.level = CPUTopologyLevelCore
 					nodeTree.AddChild(cpuTree)
 					cpu := sys.CPU(cpuID)
 					for _, threadID := range cpu.ThreadCPUSet().ToSlice() {
 						threadTree := NewCpuTree(fmt.Sprintf("p%dd%dn%dcpu%dt%d", packageID, dieID, nodeID, cpuID, threadID))
+						threadTree.level = CPUTopologyLevelThread
 						cpuTree.AddChild(threadTree)
 						threadTree.AddCpus(cpuset.NewCPUSet(threadID))
 					}
@@ -107,6 +130,24 @@ func (t *cpuTreeNode) NewAllocator(options cpuTreeAllocatorOptions) *cpuTreeAllo
 		options: options,
 	}
 	return ta
+}
+
+var WalkSkipChildren error = errors.New("skip children")
+var WalkStop error = errors.New("stop")
+
+func (t *cpuTreeNode) DepthFirstWalk(handler func(*cpuTreeNode) error) error {
+	if err := handler(t); err != nil {
+		if err == WalkSkipChildren {
+			return nil
+		}
+		return err
+	}
+	for _, child := range t.children {
+		if err := child.DepthFirstWalk(handler); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (ta *cpuTreeAllocator) sorterAllocate(tnas []cpuTreeNodeAttributes) func(int, int) bool {
@@ -301,4 +342,42 @@ func (t *cpuTreeNode) toAttributedSlice(
 		child.toAttributedSlice(currentCpus, freeCpus, filter,
 			tnas, depth+1, currentCpuCountsHere, freeCpuCountsHere)
 	}
+}
+
+var cpuTopologyLevelToString = map[CPUTopologyLevel]string{
+	CPUTopologyLevelUndefined: "undefined",
+	CPUTopologyLevelSystem:    "system",
+	CPUTopologyLevelPackage:   "package",
+	CPUTopologyLevelDie:       "die",
+	CPUTopologyLevelNuma:      "numa",
+	CPUTopologyLevelCore:      "core",
+	CPUTopologyLevelThread:    "thread",
+}
+
+func (ctl CPUTopologyLevel) String() string {
+	s, ok := cpuTopologyLevelToString[ctl]
+	if ok {
+		return s
+	}
+	return fmt.Sprintf("CPUTopologyLevelUnknown(%d)", ctl)
+}
+
+// UnmarshalJSON unmarshals a JSON string to Limit
+func (ctl *CPUTopologyLevel) UnmarshalJSON(b []byte) error {
+	i, err := strconv.Atoi(string(b))
+	if err == nil {
+		*ctl = CPUTopologyLevel(i)
+		return nil
+	}
+	name := strings.ToLower(string(b))
+	if len(name) > 2 && strings.HasPrefix(name, "\"") && strings.HasSuffix(name, "\"") {
+		name = name[1 : len(name)-1]
+		for ctlInt, ctlName := range cpuTopologyLevelToString {
+			if name == ctlName {
+				*ctl = ctlInt
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("unknown CPU topology level %q", b)
 }
