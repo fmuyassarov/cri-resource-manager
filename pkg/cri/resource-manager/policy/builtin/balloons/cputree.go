@@ -37,15 +37,21 @@ const (
 	CPUTopologyLevelThread
 )
 
+// cpuTreeAllocator allocates CPUs from the CPU tree from the branch
+// where root is the topmost CPU tree node.
 type cpuTreeAllocator struct {
 	options cpuTreeAllocatorOptions
 	root    *cpuTreeNode
 }
 
+// cpuTreeAllocatorOptions contains parameters for the CPU allocator
+// that that selects CPUs from a CPU tree.
 type cpuTreeAllocatorOptions struct {
 	topologyBalancing bool
 }
 
+// cpuTreeNode is a node in the CPU tree. cpus of the parent node is
+// the union of CPUs of cpus of its children.
 type cpuTreeNode struct {
 	name     string
 	level    CPUTopologyLevel
@@ -54,6 +60,8 @@ type cpuTreeNode struct {
 	cpus     cpuset.CPUSet
 }
 
+// NewCpuTreeFromSystem returns the root node of the topology tree
+// constructed from the underlying system.
 func NewCpuTreeFromSystem() (*cpuTreeNode, error) {
 	sys, err := system.DiscoverSystem(system.DiscoverCPUTopology)
 	if err != nil {
@@ -94,6 +102,7 @@ func NewCpuTreeFromSystem() (*cpuTreeNode, error) {
 	return sysTree, nil
 }
 
+// NewCpuTree returns a named CPU tree node.
 func NewCpuTree(name string) *cpuTreeNode {
 	return &cpuTreeNode{
 		name: name,
@@ -101,11 +110,13 @@ func NewCpuTree(name string) *cpuTreeNode {
 	}
 }
 
+// AddChild adds new child node to the CPU tree node.
 func (t *cpuTreeNode) AddChild(child *cpuTreeNode) {
 	child.parent = t
 	t.children = append(t.children, child)
 }
 
+// AddCpus adds CPUs to the CPU tree node and all its parents.
 func (t *cpuTreeNode) AddCpus(cpus cpuset.CPUSet) {
 	t.cpus = t.cpus.Union(cpus)
 	if t.parent != nil {
@@ -113,10 +124,12 @@ func (t *cpuTreeNode) AddCpus(cpus cpuset.CPUSet) {
 	}
 }
 
+// Cpus returns the CPUs of the CPU tree node.
 func (t *cpuTreeNode) Cpus() cpuset.CPUSet {
 	return t.cpus
 }
 
+// String returns the CPU tree node as a string.
 func (t *cpuTreeNode) String() string {
 	if len(t.children) == 0 {
 		return t.name
@@ -124,6 +137,8 @@ func (t *cpuTreeNode) String() string {
 	return fmt.Sprintf("%s%v", t.name, t.children)
 }
 
+// NewAllocator returns new CPU allocator for CPUs in the CPU tree
+// branch where the CPU tree node is the topmost node.
 func (t *cpuTreeNode) NewAllocator(options cpuTreeAllocatorOptions) *cpuTreeAllocator {
 	ta := &cpuTreeAllocator{
 		root:    t,
@@ -132,9 +147,22 @@ func (t *cpuTreeNode) NewAllocator(options cpuTreeAllocatorOptions) *cpuTreeAllo
 	return ta
 }
 
+// WalkSkipChildren error returned from a DepthFirstWalk handler
+// prevents walking deeper in the tree. The caller of the
+// DepthFirstWalk will get no error.
 var WalkSkipChildren error = errors.New("skip children")
+
+// WalkStop error returned from a DepthFirstWalk handler stops the
+// walk altogether. The caller of the DepthFirstWalk will get the
+// WalkStop error.
 var WalkStop error = errors.New("stop")
 
+// DepthFirstWalk walks through nodes in the tree where the CPU tree
+// node is the topmost node. Every node is passed to the handler
+// callback that handles the node and controls next step by returning:
+// - nil: continue to the next node
+// - WalkSkipChildren: continue to the next node but skip children of this node
+// - WalkStop: stop walking.
 func (t *cpuTreeNode) DepthFirstWalk(handler func(*cpuTreeNode) error) error {
 	if err := handler(t); err != nil {
 		if err == WalkSkipChildren {
@@ -150,6 +178,10 @@ func (t *cpuTreeNode) DepthFirstWalk(handler func(*cpuTreeNode) error) error {
 	return nil
 }
 
+// sorterAllocate implements an "is-less-than" callback that helps
+// sorting a slice of cpuTreeNodeAttributes. The first item in the
+// sorted list contains an optimal CPU tree node for allocating new
+// CPUs.
 func (ta *cpuTreeAllocator) sorterAllocate(tnas []cpuTreeNodeAttributes) func(int, int) bool {
 	return func(i, j int) bool {
 		if tnas[i].depth != tnas[j].depth {
@@ -179,6 +211,9 @@ func (ta *cpuTreeAllocator) sorterAllocate(tnas []cpuTreeNodeAttributes) func(in
 	}
 }
 
+// sorterRelease implements an "is-less-than" callback that helps
+// sorting a slice of cpuTreeNodeAttributes. The first item in the
+// list contains an optimal CPU tree node for releasing new CPUs.
 func (ta *cpuTreeAllocator) sorterRelease(tnas []cpuTreeNodeAttributes) func(int, int) bool {
 	return func(i, j int) bool {
 		if tnas[i].depth != tnas[j].depth {
@@ -265,8 +300,6 @@ func (ta *cpuTreeAllocator) resizeCpus(currentCpus, freeCpus cpuset.CPUSet, delt
 		})
 
 	// Sort based on attributes
-	// TODO: Parameterize the sort function based on
-	// - Spread or pack tightly balloons to resource zones
 	if delta > 0 {
 		sort.Slice(tnas, ta.sorterAllocate(tnas))
 	} else {
@@ -281,6 +314,9 @@ func (ta *cpuTreeAllocator) resizeCpus(currentCpus, freeCpus cpuset.CPUSet, delt
 	return tnas[0].freeCpus, tnas[0].currentCpus, nil
 }
 
+// cpuTreeNodeAttributes contains various attributes for a CPU tree
+// node. The attributes are used for comparing which CPU tree nodes
+// are the best for allocating or releasing CPUs.
 type cpuTreeNodeAttributes struct {
 	t                *cpuTreeNode
 	depth            int
@@ -292,12 +328,15 @@ type cpuTreeNodeAttributes struct {
 	freeCpuCounts    []int
 }
 
+// String returns cpuTreeNodeAttributes as a string.
 func (tna cpuTreeNodeAttributes) String() string {
 	return fmt.Sprintf("%s{%d,%v,%d,%d}", tna.t.name, tna.depth,
 		tna.currentCpuCounts,
 		tna.freeCpuCount, tna.freeCpuCounts)
 }
 
+// ToAttributedSlice returns the CPU tree node and recursively all its
+// child nodes in a slice that contains each node with its attributes.
 func (t *cpuTreeNode) ToAttributedSlice(
 	currentCpus, freeCpus cpuset.CPUSet, filter func(*cpuTreeNodeAttributes) bool) []cpuTreeNodeAttributes {
 	tnas := []cpuTreeNodeAttributes{}
@@ -344,6 +383,7 @@ func (t *cpuTreeNode) toAttributedSlice(
 	}
 }
 
+// cpuTopologyLevelToString defines names for all CPU topology levels.
 var cpuTopologyLevelToString = map[CPUTopologyLevel]string{
 	CPUTopologyLevelUndefined: "undefined",
 	CPUTopologyLevelSystem:    "system",
@@ -354,6 +394,7 @@ var cpuTopologyLevelToString = map[CPUTopologyLevel]string{
 	CPUTopologyLevelThread:    "thread",
 }
 
+// Strings returns topology level as a string
 func (ctl CPUTopologyLevel) String() string {
 	s, ok := cpuTopologyLevelToString[ctl]
 	if ok {
@@ -362,7 +403,7 @@ func (ctl CPUTopologyLevel) String() string {
 	return fmt.Sprintf("CPUTopologyLevelUnknown(%d)", ctl)
 }
 
-// UnmarshalJSON unmarshals a JSON string to Limit
+// UnmarshalJSON unmarshals a JSON string to CPUTopologyLevel
 func (ctl *CPUTopologyLevel) UnmarshalJSON(b []byte) error {
 	i, err := strconv.Atoi(string(b))
 	if err == nil {
