@@ -24,7 +24,7 @@ POD_ANNOTATION="balloon.balloons.cri-resource-manager.intel.com: full-core" CONT
 report allowed
 verify-metrics-has-line 'balloon="default\[0\]"'
 verify-metrics-has-line 'balloon="reserved\[0\]"'
-verify-metrics-has-line 'balloons{balloon="full-core\[0\]",balloon_type="full-core",containers="pod0:pod0c0,pod0:pod0c1",cpu_class="normal",cpus="2-3",cpus_max="2",cpus_min="2",mems="0",tot_req_millicpu="(199|200)"} 2'
+verify-metrics-has-line 'balloons{balloon="full-core\[0\]",balloon_type="full-core",containers="pod0:pod0c0,pod0:pod0c1",cpu_class="normal",cpus="2-3",cpus_allowed="2-3",cpus_allowed_count="2",cpus_count="2",cpus_max="2",cpus_min="2",mems="0",sharedidlecpus="",sharedidlecpus_count="0",tot_req_millicpu="(199|200)"} 2'
 
 # pod1 in fast-dualcore[0]
 CPUREQ="200m" MEMREQ="" CPULIM="200m" MEMLIM=""

@@ -40,6 +40,11 @@ var descriptors = []*prometheus.Desc{
 			"cpus_max",
 			"balloon",
 			"cpus",
+			"cpus_count",
+			"sharedidlecpus",
+			"sharedidlecpus_count",
+			"cpus_allowed",
+			"cpus_allowed_count",
 			"mems",
 			"containers",
 			"tot_req_millicpu",
@@ -62,6 +67,11 @@ type BalloonMetrics struct {
 	// Balloon instance metrics
 	PrettyName            string
 	Cpus                  cpuset.CPUSet
+	CpusCount             int
+	SharedIdleCpus        cpuset.CPUSet
+	SharedIdleCpusCount   int
+	CpusAllowed           cpuset.CPUSet
+	CpusAllowedCount      int
 	Mems                  string
 	ContainerNames        string
 	ContainerReqMilliCpus int
@@ -86,6 +96,11 @@ func (p *balloons) PollMetrics() policy.Metrics {
 		bm.MaxCpus = int(bln.Def.MaxCpus)
 		bm.PrettyName = bln.PrettyName()
 		bm.Cpus = bln.Cpus
+		bm.CpusCount = bm.Cpus.Size()
+		bm.SharedIdleCpus = bln.SharedIdleCpus
+		bm.SharedIdleCpusCount = bm.SharedIdleCpus.Size()
+		bm.CpusAllowed = bm.Cpus.Union(bm.SharedIdleCpus)
+		bm.CpusAllowedCount = bm.CpusAllowed.Size()
 		bm.Mems = bln.Mems.String()
 		cNames := []string{}
 		// Get container names and total requested milliCPUs.
@@ -123,6 +138,11 @@ func (p *balloons) CollectMetrics(m policy.Metrics) ([]prometheus.Metric, error)
 			strconv.Itoa(bm.MaxCpus),
 			bm.PrettyName,
 			bm.Cpus.String(),
+			strconv.Itoa(bm.CpusCount),
+			bm.SharedIdleCpus.String(),
+			strconv.Itoa(bm.SharedIdleCpusCount),
+			bm.CpusAllowed.String(),
+			strconv.Itoa(bm.CpusAllowedCount),
 			bm.Mems,
 			bm.ContainerNames,
 			strconv.Itoa(bm.ContainerReqMilliCpus))
