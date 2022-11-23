@@ -246,11 +246,23 @@ func (ta *cpuTreeAllocator) sorterRelease(tnas []cpuTreeNodeAttributes) func(int
 	}
 }
 
-// ResizeCpus returns two sets of CPUs: addFromCpus, removeFromCpus.
-//   - addFromCpus contains free CPUs from which delta CPUs
-//     can be allocated.
-//   - removeFromCpus contains CPUs in currentCpus set from which delta CPUs
-//     can be freed.
+// ResizeCpus implements topology awareness to both adding CPUs to and
+// removing them from a set of CPUs. It returns CPUs from which actual
+// allocation or releasing of CPUs can be done. ResizeCpus does not
+// allocate or release CPUs.
+//
+// Parameters:
+//   - currentCpus: a set of CPUs to/from which CPUs would be added/removed.
+//   - freeCpus: a set of CPUs available CPUs.
+//   - delta: number of CPUs to add (if positive) or remove (if negative).
+//
+// Return values:
+//   - addFromCpus contains free CPUs from which delta CPUs can be
+//     allocated. Note that the size of the set may be larger than
+//     delta: there is room for other allocation logic to select from
+//     these CPUs.
+//   - removeFromCpus contains CPUs in currentCpus set from which
+//     abs(delta) CPUs can be freed.
 func (ta *cpuTreeAllocator) ResizeCpus(currentCpus, freeCpus cpuset.CPUSet, delta int) (cpuset.CPUSet, cpuset.CPUSet, error) {
 	if delta > 0 {
 		return ta.resizeCpus(currentCpus, freeCpus, delta)
