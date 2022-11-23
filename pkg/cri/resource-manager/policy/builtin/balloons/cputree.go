@@ -317,9 +317,6 @@ func (ta *cpuTreeAllocator) resizeCpus(currentCpus, freeCpus cpuset.CPUSet, delt
 	} else {
 		sort.Slice(tnas, ta.sorterRelease(tnas))
 	}
-	for i, tna := range tnas {
-		log.Debugf("%d: %s", i, tna)
-	}
 	if len(tnas) == 0 {
 		return freeCpus, currentCpus, fmt.Errorf("not enough free CPUs")
 	}

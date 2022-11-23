@@ -625,26 +625,62 @@ func (p *balloons) chooseBalloonInstance(blnDef *BalloonDef, fm FillMethod, c ca
 				return bln, nil
 			}
 		}
-		if newBln, err := p.newBalloon(blnDef, true); err == nil {
-			if newBln.MaxAvailMilliCpus(p.freeCpus) < reqMilliCpus {
-				if fm == FillNewBalloonMust {
-					return nil, balloonsError("not enough CPUs to run container %s requesting %s mCPU. %s.MaxCPUs: %d mCPU, free CPUs: %s",
-						c.PrettyName(), reqMilliCpus, blnDef.Name, blnDef.MaxCpus*1000, p.freeCpus.Size()*1000)
-				} else {
-					return nil, nil
-				}
-			}
-			p.balloons = append(p.balloons, newBln)
-			if newBln.Cpus.Size() > 0 {
-				p.updatePinning(p.shareIdleCpus(p.freeCpus, newBln.Cpus)...)
-			}
-			return newBln, nil
-		} else {
+		newBln, err := p.newBalloon(blnDef, false)
+		if err != nil {
 			if fm == FillNewBalloonMust {
 				return nil, err
 			}
 			return nil, nil
 		}
+		// newBln may already have CPUs allocated for it. If
+		// we notice that the new balloon fill method cannot
+		// be used after all, collect steps to undo() new
+		// balloon creation.
+		undoFuncs := []func(){}
+		undo := func() {
+			for _, undoFunc := range undoFuncs {
+				undoFunc()
+			}
+		}
+		undoFuncs = append(undoFuncs, func() {
+			p.freeCpus = p.freeCpus.Union(newBln.Cpus)
+		})
+		if newBln.MaxAvailMilliCpus(p.freeCpus) < reqMilliCpus {
+			// New balloon cannot be inflated to fit new
+			// container. Release its CPUs if already
+			// allocated (MinCPUs > 0), and never add it
+			// to the list of balloons.
+			undo()
+			if fm == FillNewBalloonMust {
+				return nil, balloonsError("not enough CPUs to run container %s requesting %s mCPU. %s.MaxCPUs: %d mCPU, free CPUs: %s",
+					c.PrettyName(), reqMilliCpus, blnDef.Name, blnDef.MaxCpus*1000, p.freeCpus.Size()*1000)
+			} else {
+				return nil, nil
+			}
+		}
+		// Make the existence of the new balloon official by
+		// adding it to the balloons slice.
+		p.balloons = append(p.balloons, newBln)
+		undoFuncs = append(undoFuncs, func() {
+			p.balloons = p.balloons[:len(p.balloons)-1]
+		})
+		// If the new balloon already has CPUs, there is some
+		// housekeeping to do.
+		if newBln.Cpus.Size() > 0 {
+			// Make sure CPUs in the balloon use correct
+			// CPU class.
+			if err = p.useCpuClass(newBln); err != nil {
+				log.Errorf("failed to apply CPU configuration to new balloon %s (cpus: %s): %s",
+					newBln.PrettyName(), newBln.Cpus, err)
+				undo()
+				return nil, err
+			}
+			// Reshare idle CPUs because freeCpus have
+			// changed and CPUs of the new balloon are no
+			// more idle.
+			p.updatePinning(p.shareIdleCpus(p.freeCpus, newBln.Cpus)...)
+		}
+		return newBln, nil
 	case FillSameNamespace:
 		for _, bln := range p.balloonsByNamespace(c.GetNamespace()) {
 			if bln.Def == blnDef && p.maxFreeMilliCpus(bln) >= reqMilliCpus {
